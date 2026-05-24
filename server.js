@@ -8,6 +8,10 @@ app.use(bodyParser.json());
 const SB_URL = 'https://wgnxokqtysahkceyysjm.supabase.co';
 const SB_KEY = 'sb_publishable_JDxbNlh9GS5vot_kiWT4BA_Hr0KgLyB';
 
+// ── CONVERSATION STATE (in-memory) ────────────────────────────────────────
+// שומר את מצב השיחה לכל משתמש
+const conversations = {};
+
 // ── SUPABASE ──────────────────────────────────────────────────────────────
 async function sbGet(table, filter = '') {
   try {
@@ -39,7 +43,41 @@ async function sbPatch(table, id, updates) {
   } catch(e) {}
 }
 
-// ── TWIML RESPONSE (no Twilio client needed) ──────────────────────────────
+// ── UPLOAD FILE TO SUPABASE STORAGE ──────────────────────────────────────
+async function uploadFileFromUrl(mediaUrl, mediaType, fileName) {
+  try {
+    // Download file from Twilio
+    const TWILIO_SID = process.env.TWILIO_SID || 'AC8623aa9858cbfa2c918b7e5a5730fcc5';
+    const TWILIO_TOKEN = process.env.TWILIO_TOKEN || '0ee84d42c964d2ceb902116731d6e4ed';
+    
+    const fileRes = await fetch(mediaUrl, {
+      headers: { Authorization: 'Basic ' + Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64') }
+    });
+    const buffer = await fileRes.arrayBuffer();
+    
+    // Upload to Supabase Storage
+    const ext = mediaType.split('/')[1] || 'bin';
+    const path = `whatsapp/${Date.now()}_${fileName}.${ext}`;
+    
+    const uploadRes = await fetch(`${SB_URL}/storage/v1/object/project-files/${path}`, {
+      method: 'POST',
+      headers: {
+        apikey: SB_KEY,
+        Authorization: `Bearer ${SB_KEY}`,
+        'Content-Type': mediaType,
+      },
+      body: buffer
+    });
+    
+    if (!uploadRes.ok) return null;
+    return `${SB_URL}/storage/v1/object/public/project-files/${path}`;
+  } catch(e) {
+    console.error('Upload error:', e);
+    return null;
+  }
+}
+
+// ── TWIML RESPONSE ────────────────────────────────────────────────────────
 function twimlReply(res, message) {
   res.set('Content-Type', 'text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${message}</Message></Response>`);
@@ -51,100 +89,148 @@ function now() {
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
+  const from = req.body.From?.replace('whatsapp:', '') || '';
   const body = (req.body.Body || '').trim();
   const lower = body.toLowerCase();
+  const numMedia = parseInt(req.body.NumMedia || '0');
+  const mediaUrl = req.body.MediaUrl0;
+  const mediaType = req.body.MediaContentType0 || 'application/octet-stream';
 
   try {
-    // עזרה
+    // ── אם יש קובץ מצורף ──
+    if (numMedia > 0 && mediaUrl) {
+      const conv = conversations[from];
+      
+      if (conv && conv.waitingForFile) {
+        // יש שיחה פתוחה שמחכה לקובץ
+        const fileUrl = await uploadFileFromUrl(mediaUrl, mediaType, conv.project);
+        
+        if (fileUrl) {
+          // עדכן את הרשומה עם קישור לקובץ
+          if (conv.recordId) {
+            await sbPatch(conv.table, conv.recordId, { files: [fileUrl] });
+          }
+          delete conversations[from];
+          return twimlReply(res, `✅ הקובץ הועלה ושויך!\n📁 ${conv.project}\n🔗 הקובץ זמין באפליקציה`);
+        } else {
+          delete conversations[from];
+          return twimlReply(res, `⚠️ לא הצלחתי להעלות את הקובץ. נסה שוב.`);
+        }
+      } else {
+        // קובץ ללא שיחה פתוחה
+        return twimlReply(res, `📎 קיבלתי קובץ!\nלאיזה פרויקט לשייך אותו?\nשלח: שם הפרויקט`);
+      }
+    }
+
+    // ── אם יש שיחה פתוחה שמחכה לשם פרויקט לקובץ ──
+    if (conversations[from]?.waitingForProjectName) {
+      const project = body.trim();
+      conversations[from].project = project;
+      conversations[from].waitingForProjectName = false;
+      conversations[from].waitingForFile = true;
+      return twimlReply(res, `📁 פרויקט: ${project}\nעכשיו שלח את הקובץ 📎`);
+    }
+
+    // ── עזרה ──
     if (lower === 'עזרה' || lower === 'help' || lower === '?') {
       return twimlReply(res,
-        `🤖 Steel Control Bot\n` +
-        `━━━━━━━━━━━━━━━\n\n` +
+        `🤖 Steel Control Bot\n━━━━━━━━━━━━━━━\n\n` +
         `📝 הערה חדשה:\n[פרויקט] - [הערה]\nדוגמה: תולדות - חסר פלטה 150\n\n` +
+        `💰 תמחור חדש:\nתמחורים - [שם פרויקט]\n\n` +
         `📋 סיכום פרויקט:\nסיכום [שם]\n\n` +
         `📂 כל הפתוח:\nמה פתוח?\n\n` +
         `✅ סגור:\nסגור [תיאור]`
       );
     }
 
-    // סיכום פרויקט
+    // ── סיכום פרויקט ──
     if (lower.startsWith('סיכום ')) {
       const projectName = body.substring(6).trim();
       const tasks = await sbGet('tasks', `project=ilike.*${encodeURIComponent(projectName)}*`);
-
-      if (!tasks.length) {
-        return twimlReply(res, `❌ לא נמצאו הערות לפרויקט: ${projectName}`);
-      }
+      if (!tasks.length) return twimlReply(res, `❌ לא נמצאו הערות לפרויקט: ${projectName}`);
 
       const open = tasks.filter(t => !t.done);
       const closed = tasks.filter(t => t.done);
-
       let msg = `📋 סיכום: ${projectName}\n━━━━━━━━━━━━━━━\n`;
-      if (open.length) {
-        msg += `\n🔴 פתוח (${open.length}):\n`;
-        open.forEach(t => { msg += `• ${t.description}\n`; });
-      }
-      if (closed.length) {
-        msg += `\n✅ טופל (${closed.length}):\n`;
-        closed.forEach(t => { msg += `• ${t.description}\n`; });
-      }
+      if (open.length) { msg += `\n🔴 פתוח (${open.length}):\n`; open.forEach(t => { msg += `• ${t.description}\n`; }); }
+      if (closed.length) { msg += `\n✅ טופל (${closed.length}):\n`; closed.forEach(t => { msg += `• ${t.description}\n`; }); }
       return twimlReply(res, msg);
     }
 
-    // מה פתוח
+    // ── מה פתוח ──
     if (lower === 'מה פתוח?' || lower === 'מה פתוח' || lower === 'כל הפתוח') {
       const tasks = await sbGet('tasks', 'done=eq.false');
       if (!tasks.length) return twimlReply(res, '✅ אין משימות פתוחות!');
-
       const byProject = {};
-      tasks.forEach(t => {
-        const p = t.project || 'כללי';
-        if (!byProject[p]) byProject[p] = [];
-        byProject[p].push(t);
-      });
-
+      tasks.forEach(t => { const p = t.project || 'כללי'; if (!byProject[p]) byProject[p] = []; byProject[p].push(t); });
       let msg = `📋 כל הפתוח:\n━━━━━━━━━━━━━━━\n`;
-      Object.entries(byProject).forEach(([proj, items]) => {
-        msg += `\n📁 ${proj} (${items.length})\n`;
-        items.forEach(t => { msg += `• ${t.description}\n`; });
-      });
+      Object.entries(byProject).forEach(([proj, items]) => { msg += `\n📁 ${proj} (${items.length})\n`; items.forEach(t => { msg += `• ${t.description}\n`; }); });
       return twimlReply(res, msg);
     }
 
-    // סגור משימה
+    // ── סגור משימה ──
     if (lower.startsWith('סגור ')) {
       const desc = body.substring(5).trim();
       const tasks = await sbGet('tasks', `description=ilike.*${encodeURIComponent(desc)}*&done=eq.false`);
       if (!tasks.length) return twimlReply(res, `❌ לא נמצאה משימה: "${desc}"`);
-
       await sbPatch('tasks', tasks[0].id, { done: true });
       return twimlReply(res, `✅ סומן כטופל:\n"${tasks[0].description}"\nפרויקט: ${tasks[0].project}`);
     }
 
-    // הוספת הערה: "פרויקט - תיאור"
+    // ── הוספת הערה: "פרויקט - תיאור" ──
     const sep = body.includes(' - ') ? ' - ' : body.includes(': ') ? ': ' : null;
     if (sep) {
       const [projectRaw, ...descParts] = body.split(sep);
       const project = projectRaw.trim();
       const description = descParts.join(sep).trim();
 
-      await sbPost('tasks', {
-        client: '',
-        project,
-        type: 'הערה מוואטסאפ',
-        description,
-        due_date: '',
-        urgent: false,
-        reminder_date: '',
-        reminder_time: '',
-        files: [],
-        done: false
-      });
+      let table = 'tasks';
+      let row = {};
+      let savedId = null;
 
-      return twimlReply(res, `✅ נשמר!\n📁 ${project}\n📝 ${description}\n\nלסיכום שלח:\nסיכום ${project}`);
+      if (project === 'תמחורים') {
+        // שמור בתמחורים
+        table = 'pricing';
+        row = {
+          agent: 'וואטסאפ', project: description, description: '',
+          category: '', status: 'ממתין', weight: '–', date: now(),
+          urgent: false, files: [], submitted_price: '', closed_price: '',
+          submitted: false, archived: false
+        };
+        const result = await sbPost(table, row);
+        savedId = Array.isArray(result) ? result[0]?.id : result?.id;
+        
+        // שמור מצב שיחה
+        conversations[from] = { waitingForFile: true, project: description, table, recordId: savedId };
+        
+        return twimlReply(res, `✅ נשמר בתמחורים!\n📋 ${description}\n\nהאם יש קובץ לשייך? 📎\nשלח קובץ עכשיו או כתוב "לא" לדלג`);
+      } else {
+        // שמור במשימות
+        row = {
+          client: '', project, type: 'הערה מוואטסאפ', description,
+          due_date: '', urgent: false, reminder_date: '', reminder_time: '',
+          files: [], done: false
+        };
+        const result = await sbPost(table, row);
+        savedId = Array.isArray(result) ? result[0]?.id : result?.id;
+        
+        // שמור מצב שיחה
+        conversations[from] = { waitingForFile: true, project, table, recordId: savedId };
+        
+        return twimlReply(res, `✅ נשמר!\n📁 ${project}\n📝 ${description}\n\nהאם יש קובץ לשייך? 📎\nשלח קובץ עכשיו או כתוב "לא" לדלג`);
+      }
     }
 
-    // לא הובן
+    // ── "לא" – לדלג על קובץ ──
+    if (lower === 'לא' || lower === 'no' || lower === 'skip') {
+      if (conversations[from]) {
+        const proj = conversations[from].project;
+        delete conversations[from];
+        return twimlReply(res, `👍 בסדר, נשמר ללא קובץ\nפרויקט: ${proj}`);
+      }
+    }
+
+    // ── לא הובן ──
     twimlReply(res, `לא הבנתי 🤔\nשלח "עזרה" לרשימת הפקודות`);
 
   } catch(err) {
