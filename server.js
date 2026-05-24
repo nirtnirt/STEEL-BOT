@@ -68,7 +68,8 @@ async function uploadFileFromUrl(mediaUrl, mediaType, fileName) {
     console.log('File size:', buffer.byteLength);
     
     const ext = mediaType.split('/')[1] || 'bin';
-    const path = `whatsapp/${Date.now()}_${fileName}.${ext}`;
+    const safeName = Date.now().toString();
+    const path = `whatsapp/${safeName}.${ext}`;
     
     const uploadRes = await fetch(`${SB_URL}/storage/v1/object/project-files/${path}`, {
       method: 'POST',
