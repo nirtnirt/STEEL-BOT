@@ -46,16 +46,27 @@ async function sbPatch(table, id, updates) {
 // ── UPLOAD FILE TO SUPABASE STORAGE ──────────────────────────────────────
 async function uploadFileFromUrl(mediaUrl, mediaType, fileName) {
   try {
-    // Download file from Twilio
-    const TWILIO_SID = process.env.TWILIO_SID || 'AC8623aa9858cbfa2c918b7e5a5730fcc5';
-    const TWILIO_TOKEN = process.env.TWILIO_TOKEN || '0ee84d42c964d2ceb902116731d6e4ed';
+    const TWILIO_SID = process.env.TWILIO_SID;
+    const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
+    
+    console.log('Uploading file:', mediaUrl, 'type:', mediaType);
+    console.log('Twilio SID exists:', !!TWILIO_SID);
+    console.log('Twilio TOKEN exists:', !!TWILIO_TOKEN);
     
     const fileRes = await fetch(mediaUrl, {
       headers: { Authorization: 'Basic ' + Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64') }
     });
-    const buffer = await fileRes.arrayBuffer();
     
-    // Upload to Supabase Storage
+    console.log('File download status:', fileRes.status);
+    
+    if (!fileRes.ok) {
+      console.error('Failed to download file:', fileRes.status, fileRes.statusText);
+      return null;
+    }
+    
+    const buffer = await fileRes.arrayBuffer();
+    console.log('File size:', buffer.byteLength);
+    
     const ext = mediaType.split('/')[1] || 'bin';
     const path = `whatsapp/${Date.now()}_${fileName}.${ext}`;
     
@@ -69,10 +80,14 @@ async function uploadFileFromUrl(mediaUrl, mediaType, fileName) {
       body: buffer
     });
     
+    console.log('Upload status:', uploadRes.status);
+    const uploadBody = await uploadRes.text();
+    console.log('Upload response:', uploadBody);
+    
     if (!uploadRes.ok) return null;
     return `${SB_URL}/storage/v1/object/public/project-files/${path}`;
   } catch(e) {
-    console.error('Upload error:', e);
+    console.error('Upload error:', e.message);
     return null;
   }
 }
