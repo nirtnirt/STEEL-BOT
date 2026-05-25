@@ -205,10 +205,11 @@ app.post('/webhook', async (req, res) => {
       let savedId = null;
 
       if (project === 'תמחורים') {
-        // שמור בתמחורים
+        // שמור בתמחורים עם מספר השולח כסוכן
         table = 'pricing';
+        const agentName = `וואטסאפ (${from.slice(-4)})`; // 4 ספרות אחרונות
         row = {
-          agent: 'וואטסאפ', project: description, description: '',
+          agent: agentName, project: description, description: '',
           category: '', status: 'ממתין', weight: '–', date: now(),
           urgent: false, files: [], submitted_price: '', closed_price: '',
           submitted: false, archived: false
