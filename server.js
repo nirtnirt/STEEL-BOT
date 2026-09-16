@@ -1,262 +1,262 @@
-const express = require('express');
-const bodyParser = require('body-parser');
+/* ══════════════════════════════════════════════════════════════
+   Steel Control — בוט וואטסאפ (Twilio → Supabase)
+   גרסה 3: מתחבר כמשתמש אמיתי, עובר דרך RLS, מאמת שהבקשה
+   באמת הגיעה מטוויליו, ומגביל למספרים מורשים בלבד.
 
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+   מה חדש ב-3: הבוט אינו מנחש לבד לאן הודעה שייכת. הוא מעביר
+   אותה ל-Edge Function «bot-route», שקוראת את חוקי השיוך שניר
+   הגדיר במסך «חוקי הבוט», שולחת אותם לקלוד יחד עם הכרטיסים
+   הפתוחים, ומקבלת החלטה. כך שינוי בחוקים נכנס לתוקף מיד, בלי
+   לפרוס את הבוט מחדש, והמפתח של קלוד לא יושב כאן בכלל.
+   ══════════════════════════════════════════════════════════════ */
 
-const SB_URL = 'https://wgnxokqtysahkceyysjm.supabase.co';
-const SB_KEY = 'sb_publishable_JDxbNlh9GS5vot_kiWT4BA_Hr0KgLyB';
+const express = require('express')
+const crypto = require('crypto')
+const twilioLib = require('twilio')
+const { createClient } = require('@supabase/supabase-js')
 
-// ── CONVERSATION STATE (in-memory) ────────────────────────────────────────
-// שומר את מצב השיחה לכל משתמש
-const conversations = {};
+// ── קונפיגורציה: הכול ממשתני סביבה, שום סוד לא יושב בקוד ─────
+const {
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_WHATSAPP_FROM = 'whatsapp:+14155238886',
+  SUPABASE_URL = 'https://wgnxokqtysahkceyysjm.supabase.co',
+  SUPABASE_ANON_KEY,
+  BOT_USERNAME = 'בוט-וואטסאפ',
+  BOT_PASSWORD,
+  ALLOWED_NUMBERS = '',          // "+972501234567,+972521111111" — ריק = כולם (לא מומלץ)
+  PUBLIC_URL = '',               // כתובת השירות ב-Render, לאימות חתימת טוויליו
+  PORT = 3000,
+} = process.env
 
-// ── SUPABASE ──────────────────────────────────────────────────────────────
-async function sbGet(table, filter = '') {
-  try {
-    const res = await fetch(`${SB_URL}/rest/v1/${table}?${filter}&order=created_at.desc`, {
-      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` }
-    });
-    return await res.json();
-  } catch(e) { return []; }
+const required = { TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, SUPABASE_ANON_KEY, BOT_PASSWORD }
+for (const [k, v] of Object.entries(required)) {
+  if (!v) { console.error(`✖ חסר משתנה סביבה: ${k}`); process.exit(1) }
 }
 
-async function sbPost(table, row) {
-  try {
-    const res = await fetch(`${SB_URL}/rest/v1/${table}`, {
-      method: 'POST',
-      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
-      body: JSON.stringify(row)
-    });
-    return await res.json();
-  } catch(e) { return null; }
+const twilio = twilioLib(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: false, autoRefreshToken: true },
+})
+
+const allowList = ALLOWED_NUMBERS.split(',').map(s => s.trim()).filter(Boolean)
+const isAllowed = num => allowList.length === 0 || allowList.includes(num)
+
+// ── התחברות לסופאבייס כמשתמש הבוט ────────────────────────────
+const usernameToEmail = u =>
+  'u' + crypto.createHash('sha256').update(String(u).trim().toLowerCase(), 'utf8').digest('hex')
+  + '@steel-control.app'
+
+let botProfile = null
+let signInPromise = null
+
+async function ensureSignedIn() {
+  const { data: { session } } = await supabase.auth.getSession()
+  if (session && botProfile) return
+  if (!signInPromise) {
+    signInPromise = (async () => {
+      const email = usernameToEmail(BOT_USERNAME)
+      const { error } = await supabase.auth.signInWithPassword({ email, password: BOT_PASSWORD })
+      if (error) throw new Error(`התחברות הבוט ל-Supabase נכשלה: ${error.message}`)
+      const { data: me } = await supabase.from('profiles').select('*').limit(1)
+        .eq('username', BOT_USERNAME).maybeSingle()
+      botProfile = me
+      if (!me?.approved) throw new Error('חשבון הבוט קיים אך אינו מאושר — אשר אותו במסך «משתמשים»')
+      console.log(`✔ הבוט מחובר כ-${me.display_name}`)
+    })().finally(() => { signInPromise = null })
+  }
+  return signInPromise
 }
 
-async function sbPatch(table, id, updates) {
+// ── שליחת הודעה חזרה לוואטסאפ ────────────────────────────────
+async function reply(to, body) {
   try {
-    await fetch(`${SB_URL}/rest/v1/${table}?id=eq.${id}`, {
-      method: 'PATCH',
-      headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates)
-    });
-  } catch(e) {}
-}
-
-// ── UPLOAD FILE TO SUPABASE STORAGE ──────────────────────────────────────
-async function uploadFileFromUrl(mediaUrl, mediaType, fileName) {
-  try {
-    const TWILIO_SID = process.env.TWILIO_SID;
-    const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
-    
-    console.log('Uploading file:', mediaUrl, 'type:', mediaType);
-    console.log('Twilio SID exists:', !!TWILIO_SID);
-    console.log('Twilio TOKEN exists:', !!TWILIO_TOKEN);
-    
-    const fileRes = await fetch(mediaUrl, {
-      headers: { Authorization: 'Basic ' + Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString('base64') }
-    });
-    
-    console.log('File download status:', fileRes.status);
-    
-    if (!fileRes.ok) {
-      console.error('Failed to download file:', fileRes.status, fileRes.statusText);
-      return null;
-    }
-    
-    const buffer = await fileRes.arrayBuffer();
-    console.log('File size:', buffer.byteLength);
-    
-    const ext = mediaType.split('/')[1] || 'bin';
-    const safeName = Date.now().toString();
-    const path = `whatsapp/${safeName}.${ext}`;
-    
-    const uploadRes = await fetch(`${SB_URL}/storage/v1/object/project-files/${path}`, {
-      method: 'POST',
-      headers: {
-        apikey: SB_KEY,
-        Authorization: `Bearer ${SB_KEY}`,
-        'Content-Type': mediaType,
-      },
-      body: buffer
-    });
-    
-    console.log('Upload status:', uploadRes.status);
-    const uploadBody = await uploadRes.text();
-    console.log('Upload response:', uploadBody);
-    
-    if (!uploadRes.ok) return null;
-    return `${SB_URL}/storage/v1/object/public/project-files/${path}`;
-  } catch(e) {
-    console.error('Upload error:', e.message);
-    return null;
+    await twilio.messages.create({ from: TWILIO_WHATSAPP_FROM, to: `whatsapp:${to}`, body })
+  } catch (e) {
+    console.error('שליחת הודעה נכשלה:', e.message)
   }
 }
 
-// ── TWIML RESPONSE ────────────────────────────────────────────────────────
-function twimlReply(res, message) {
-  res.set('Content-Type', 'text/xml');
-  res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${message}</Message></Response>`);
+// ── העלאת מדיה מוואטסאפ לאחסון של סופאבייס ───────────────────
+async function saveMedia(req, taskKey) {
+  const count = parseInt(req.body.NumMedia || '0', 10)
+  if (!count) return []
+  const files = []
+  for (let i = 0; i < count; i++) {
+    const url = req.body[`MediaUrl${i}`]
+    const type = req.body[`MediaContentType${i}`] || 'application/octet-stream'
+    if (!url) continue
+    try {
+      const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64')
+      const res = await fetch(url, { headers: { Authorization: `Basic ${auth}` } })
+      if (!res.ok) { console.error('הורדת מדיה נכשלה:', res.status); continue }
+      const buf = Buffer.from(await res.arrayBuffer())
+      const ext = (type.split('/')[1] || 'bin').split(';')[0]
+      const name = `whatsapp_${Date.now()}_${i}.${ext}`
+      const path = `tasks/whatsapp/${taskKey}/${name}`
+      const { error } = await supabase.storage.from('project-files').upload(path, buf, { contentType: type })
+      if (error) { console.error('העלאה לאחסון נכשלה:', error.message); continue }
+      files.push({ name, path, size: buf.length, type })
+    } catch (e) {
+      console.error('טיפול במדיה נכשל:', e.message)
+    }
+  }
+  return files
 }
 
-function now() {
-  return new Date().toLocaleDateString('he-IL');
+// ── פקודות ───────────────────────────────────────────────────
+const HELP =
+  `🤖 *Steel Control*\n━━━━━━━━━━━━━━━\n\n` +
+  `📝 *פשוט כתוב מה קרה.*\nאני מבין לבד לאיזה מסך ולאיזה\n` +
+  `פרויקט זה שייך ומכניס לשם.\n` +
+  `לדוגמה: "הגיעו הפרופילים לדוניץ"\n` +
+  `אפשר לצרף תמונה.\n` +
+  `אם לא אהיה בטוח — זה יחכה לשיוך במשימות.\n\n` +
+  `📋 *סיכום פרויקט:*\nסיכום [שם פרויקט]\n\n` +
+  `📂 *כל הפתוח:*\nמה פתוח?\n\n` +
+  `✅ *סגירת משימה:*\nסגור [תיאור]\n\n` +
+  `❓ עזרה`
+
+/* שם לשולח — המספר הוא מה שיש, והוא מופיע בהערה שנכתבת
+   באפליקציה כדי שיהיה ברור מי כתב. */
+const senderName = from => String(from || '').replace(/^whatsapp:/, '')
+
+const fmtDate = d => (d ? new Date(d).toLocaleDateString('he-IL', { day: '2-digit', month: '2-digit' }) : '')
+
+async function handle(req, from, body) {
+  const lower = body.toLowerCase()
+
+  // ── עזרה ──
+  if (['עזרה', 'help', '?'].includes(lower)) return HELP
+
+  // ── סיכום פרויקט ──
+  if (lower.startsWith('סיכום ')) {
+    const project = body.slice(6).trim()
+    const { data, error } = await supabase.from('tasks').select('*')
+      .ilike('project', `%${project}%`).order('created_at', { ascending: false }).limit(80)
+    if (error) throw error
+    if (!data.length) return `❌ לא נמצאו משימות לפרויקט: ${project}`
+
+    const open = data.filter(t => !t.done)
+    const closed = data.filter(t => t.done)
+    let msg = `📋 *סיכום: ${project}*\n━━━━━━━━━━━━━━━\n`
+    if (open.length) {
+      msg += `\n🔴 *פתוח (${open.length}):*\n`
+      open.forEach(t => { msg += `• ${t.description || t.project}${t.due_date ? ` (${fmtDate(t.due_date)})` : ''}\n` })
+    }
+    if (closed.length) {
+      msg += `\n✅ *טופל (${closed.length}):*\n`
+      closed.slice(0, 15).forEach(t => { msg += `• ${t.description || t.project}\n` })
+    }
+    return msg
+  }
+
+  // ── כל הפתוח ──
+  if (['מה פתוח?', 'מה פתוח', 'כל הפתוח'].includes(lower)) {
+    const { data, error } = await supabase.from('tasks').select('*')
+      .eq('done', false).order('created_at', { ascending: false }).limit(120)
+    if (error) throw error
+    if (!data.length) return '✅ אין משימות פתוחות!'
+
+    const byProject = {}
+    data.forEach(t => { const p = t.project || 'כללי'; (byProject[p] ||= []).push(t) })
+    let msg = `📋 *כל המשימות הפתוחות:*\n━━━━━━━━━━━━━━━\n`
+    Object.entries(byProject).forEach(([p, items]) => {
+      msg += `\n📁 *${p}* (${items.length})\n`
+      items.forEach(t => { msg += `• ${t.description || '—'}\n` })
+    })
+    return msg
+  }
+
+  // ── סגירת משימה ──
+  if (lower.startsWith('סגור ')) {
+    const q = body.slice(5).trim()
+    const { data, error } = await supabase.from('tasks').select('*')
+      .eq('done', false).ilike('description', `%${q}%`)
+      .order('created_at', { ascending: false }).limit(5)
+    if (error) throw error
+    if (!data.length) return `❌ לא נמצאה משימה פתוחה: "${q}"`
+    if (data.length > 1) {
+      let msg = `נמצאו ${data.length} משימות פתוחות שמתאימות ל-"${q}":\n`
+      data.forEach(t => { msg += `• ${t.description} (${t.project})\n` })
+      return msg + `\nהיה יותר ספציפי כדי שאדע איזו לסגור.`
+    }
+    const t = data[0]
+    const { error: upErr } = await supabase.from('tasks')
+      .update({ done: true, status: 'done' }).eq('id', t.id)
+    if (upErr) throw upErr
+    return `✅ סומן כטופל: "${t.description}" (${t.project})`
+  }
+
+  /* ── כל השאר: קלוד מחליט לאן זה שייך ──────────────────────
+     אין יותר פורמט חובה. «פרויקט - הערה» עדיין עובד, כי הוא
+     פשוט טקסט שקל להבין ממנו — אבל הוא כבר לא תנאי. */
+  const files = await saveMedia(req, `${Date.now()}`)
+
+  const { data, error } = await supabase.functions.invoke('bot-route', {
+    body: { body, sender: senderName(from), from_number: from, files },
+  })
+  if (error) {
+    console.error('bot-route נכשל:', error.message)
+    /* כשל בשיוך אסור שיבליע הודעה. היא נכנסת כמשימה שממתינה
+       לשיוך, בדיוק כמו הודעה שלא הובנה. */
+    await supabase.rpc('bot_ingest', { p: {
+      from_number: from, sender: senderName(from), body, note: body, files,
+      reason: 'השיוך האוטומטי נכשל: ' + error.message,
+    } })
+    return `📥 נקלט, אבל השיוך האוטומטי לא עבד כרגע.\nזה ממתין לשיוך במסך «משימות».`
+  }
+  if (data?.error === 'disabled') return '🤖 הבוט כבוי כרגע בהגדרות האפליקציה.'
+  return data?.reply || '✅ נקלט'
+
 }
 
-// ── WEBHOOK ───────────────────────────────────────────────────────────────
-app.post('/webhook', async (req, res) => {
-  const from = req.body.From?.replace('whatsapp:', '') || '';
-  const body = (req.body.Body || '').trim();
-  const lower = body.toLowerCase();
-  const numMedia = parseInt(req.body.NumMedia || '0');
-  const mediaUrl = req.body.MediaUrl0;
-  const mediaType = req.body.MediaContentType0 || 'application/octet-stream';
+// ── שרת ──────────────────────────────────────────────────────
+const app = express()
+app.set('trust proxy', true)
+app.use(express.urlencoded({ extended: false }))
+
+/** מאמת שהבקשה באמת נשלחה מטוויליו ולא מכל אחד שיודע את הכתובת */
+function verifyTwilio(req, res, next) {
+  const signature = req.header('X-Twilio-Signature')
+  const url = (PUBLIC_URL ? PUBLIC_URL.replace(/\/$/, '') : `https://${req.get('host')}`) + req.originalUrl
+  if (!signature || !twilioLib.validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body)) {
+    console.warn('בקשה נדחתה — חתימת טוויליו לא תקינה', url)
+    return res.sendStatus(403)
+  }
+  next()
+}
+
+app.post('/webhook', verifyTwilio, async (req, res) => {
+  res.sendStatus(200)   // עונים מיד כדי לא להחזיק את טוויליו
+
+  const from = (req.body.From || '').replace('whatsapp:', '')
+  const body = (req.body.Body || '').trim()
+  if (!from) return
+
+  if (!isAllowed(from)) {
+    console.warn('מספר לא מורשה:', from)
+    return reply(from, '🚫 המספר הזה אינו מורשה לשימוש במערכת. פנה למנהל.')
+  }
+  if (!body && !parseInt(req.body.NumMedia || '0', 10)) return
 
   try {
-    // ── אם יש קובץ מצורף ──
-    if (numMedia > 0 && mediaUrl) {
-      const conv = conversations[from];
-      
-      if (conv && conv.waitingForFile) {
-        // יש שיחה פתוחה שמחכה לקובץ
-        const fileUrl = await uploadFileFromUrl(mediaUrl, mediaType, conv.project);
-        
-        if (fileUrl) {
-          // עדכן את הרשומה עם קישור לקובץ
-          if (conv.recordId) {
-            await sbPatch(conv.table, conv.recordId, { files: [fileUrl] });
-          }
-          delete conversations[from];
-          return twimlReply(res, `✅ הקובץ הועלה ושויך!\n📁 ${conv.project}\n🔗 הקובץ זמין באפליקציה`);
-        } else {
-          delete conversations[from];
-          return twimlReply(res, `⚠️ לא הצלחתי להעלות את הקובץ. נסה שוב.`);
-        }
-      } else {
-        // קובץ ללא שיחה פתוחה
-        return twimlReply(res, `📎 קיבלתי קובץ!\nלאיזה פרויקט לשייך אותו?\nשלח: שם הפרויקט`);
-      }
-    }
-
-    // ── אם יש שיחה פתוחה שמחכה לשם פרויקט לקובץ ──
-    if (conversations[from]?.waitingForProjectName) {
-      const project = body.trim();
-      conversations[from].project = project;
-      conversations[from].waitingForProjectName = false;
-      conversations[from].waitingForFile = true;
-      return twimlReply(res, `📁 פרויקט: ${project}\nעכשיו שלח את הקובץ 📎`);
-    }
-
-    // ── עזרה ──
-    if (lower === 'עזרה' || lower === 'help' || lower === '?') {
-      return twimlReply(res,
-        `🤖 Steel Control Bot\n━━━━━━━━━━━━━━━\n\n` +
-        `📝 הערה חדשה:\n[פרויקט] - [הערה]\nדוגמה: תולדות - חסר פלטה 150\n\n` +
-        `💰 תמחור חדש:\nתמחורים - [שם פרויקט]\n\n` +
-        `📋 סיכום פרויקט:\nסיכום [שם]\n\n` +
-        `📂 כל הפתוח:\nמה פתוח?\n\n` +
-        `✅ סגור:\nסגור [תיאור]`
-      );
-    }
-
-    // ── סיכום פרויקט ──
-    if (lower.startsWith('סיכום ')) {
-      const projectName = body.substring(6).trim();
-      const tasks = await sbGet('tasks', `project=ilike.*${encodeURIComponent(projectName)}*`);
-      if (!tasks.length) return twimlReply(res, `❌ לא נמצאו הערות לפרויקט: ${projectName}`);
-
-      const open = tasks.filter(t => !t.done);
-      const closed = tasks.filter(t => t.done);
-      let msg = `📋 סיכום: ${projectName}\n━━━━━━━━━━━━━━━\n`;
-      if (open.length) { msg += `\n🔴 פתוח (${open.length}):\n`; open.forEach(t => { msg += `• ${t.description}\n`; }); }
-      if (closed.length) { msg += `\n✅ טופל (${closed.length}):\n`; closed.forEach(t => { msg += `• ${t.description}\n`; }); }
-      return twimlReply(res, msg);
-    }
-
-    // ── מה פתוח ──
-    if (lower === 'מה פתוח?' || lower === 'מה פתוח' || lower === 'כל הפתוח') {
-      const tasks = await sbGet('tasks', 'done=eq.false');
-      if (!tasks.length) return twimlReply(res, '✅ אין משימות פתוחות!');
-      const byProject = {};
-      tasks.forEach(t => { const p = t.project || 'כללי'; if (!byProject[p]) byProject[p] = []; byProject[p].push(t); });
-      let msg = `📋 כל הפתוח:\n━━━━━━━━━━━━━━━\n`;
-      Object.entries(byProject).forEach(([proj, items]) => { msg += `\n📁 ${proj} (${items.length})\n`; items.forEach(t => { msg += `• ${t.description}\n`; }); });
-      return twimlReply(res, msg);
-    }
-
-    // ── סגור משימה ──
-    if (lower.startsWith('סגור ')) {
-      const desc = body.substring(5).trim();
-      const tasks = await sbGet('tasks', `description=ilike.*${encodeURIComponent(desc)}*&done=eq.false`);
-      if (!tasks.length) return twimlReply(res, `❌ לא נמצאה משימה: "${desc}"`);
-      await sbPatch('tasks', tasks[0].id, { done: true });
-      return twimlReply(res, `✅ סומן כטופל:\n"${tasks[0].description}"\nפרויקט: ${tasks[0].project}`);
-    }
-
-    // ── הוספת הערה: "פרויקט - תיאור" ──
-    const sep = body.includes(' - ') ? ' - ' : body.includes(': ') ? ': ' : null;
-    if (sep) {
-      const [projectRaw, ...descParts] = body.split(sep);
-      const project = projectRaw.trim();
-      const description = descParts.join(sep).trim();
-
-      let table = 'tasks';
-      let row = {};
-      let savedId = null;
-
-      if (project === 'תמחורים') {
-        // שמור בתמחורים עם מספר השולח כסוכן
-        table = 'pricing';
-        const agentName = `וואטסאפ (${from.slice(-4)})`; // 4 ספרות אחרונות
-        row = {
-          agent: agentName, project: description, description: '',
-          category: '', status: 'ממתין', weight: '–', date: now(),
-          urgent: false, files: [], submitted_price: '', closed_price: '',
-          submitted: false, archived: false
-        };
-        const result = await sbPost(table, row);
-        savedId = Array.isArray(result) ? result[0]?.id : result?.id;
-        
-        // שמור מצב שיחה
-        conversations[from] = { waitingForFile: true, project: description, table, recordId: savedId };
-        
-        return twimlReply(res, `✅ נשמר בתמחורים!\n📋 ${description}\n\nהאם יש קובץ לשייך? 📎\nשלח קובץ עכשיו או כתוב "לא" לדלג`);
-      } else {
-        // שמור במשימות
-        row = {
-          client: '', project, type: 'הערה מוואטסאפ', description,
-          due_date: '', urgent: false, reminder_date: '', reminder_time: '',
-          files: [], done: false
-        };
-        const result = await sbPost(table, row);
-        savedId = Array.isArray(result) ? result[0]?.id : result?.id;
-        
-        // שמור מצב שיחה
-        conversations[from] = { waitingForFile: true, project, table, recordId: savedId };
-        
-        return twimlReply(res, `✅ נשמר!\n📁 ${project}\n📝 ${description}\n\nהאם יש קובץ לשייך? 📎\nשלח קובץ עכשיו או כתוב "לא" לדלג`);
-      }
-    }
-
-    // ── "לא" – לדלג על קובץ ──
-    if (lower === 'לא' || lower === 'no' || lower === 'skip') {
-      if (conversations[from]) {
-        const proj = conversations[from].project;
-        delete conversations[from];
-        return twimlReply(res, `👍 בסדר, נשמר ללא קובץ\nפרויקט: ${proj}`);
-      }
-    }
-
-    // ── לא הובן ──
-    twimlReply(res, `לא הבנתי 🤔\nשלח "עזרה" לרשימת הפקודות`);
-
-  } catch(err) {
-    console.error(err);
-    twimlReply(res, '❌ שגיאה, נסה שוב');
+    await ensureSignedIn()
+    const answer = await handle(req, from, body)
+    if (answer) await reply(from, answer)
+  } catch (err) {
+    console.error('שגיאה בטיפול בהודעה:', err)
+    await reply(from, `❌ שגיאה: ${err.message || 'נסה שוב בעוד רגע'}`)
   }
-});
+})
 
-app.get('/', (req, res) => res.send('Steel Control Bot 🤖 is running!'));
+app.get('/', (_req, res) => res.send('Steel Control Bot 🤖 is running'))
+app.get('/health', async (_req, res) => {
+  try { await ensureSignedIn(); res.json({ ok: true, bot: botProfile?.display_name }) }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }) }
+})
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Steel Control bot listening on ${PORT}`)
+  ensureSignedIn().catch(e => console.error(e.message))
+})
